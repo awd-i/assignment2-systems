@@ -1,28 +1,39 @@
 """End-to-end benchmarking of the basics Transformer model.
 
 Times the forward pass, backward pass, and optimizer step, with warm-up steps
-and per-phase mean/std statistics.
+and per-phase mean/std statistics. Every phase ends with a device synchronize,
+so each timing includes the GPU work that the phase launched.
 
 Examples:
     # Forward-only timing for the small model
     uv run python -m cs336_systems.benchmark --size small --mode forward
 
-    # Full training step (forward + backward + optimizer) for all sizes,
+    # Full training step (forward + backward + optimizer) for several sizes,
     # 5 warm-up steps and 10 measured steps (the part (b) setting)
-    uv run python -m cs336_systems.benchmark --size small medium large xl 10B \
-        --mode full --warmup 5 --steps 10
+    uv run python -m cs336_systems.benchmark --size small medium large --mode full --warmup 5 --steps 10
+
+    # Under Nsight Systems: NVTX ranges mark warm-up vs. measured steps, each
+    # phase, each module type, and the pieces of scaled dot-product attention
+    nsys profile --trace=cuda,nvtx -o small_512 python -m cs336_systems.benchmark --size small --nvtx
 """
 
 import argparse
+import gc
+import json
+import math
+import re
 import timeit
 from contextlib import nullcontext
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.cuda.nvtx as nvtx
+from einops import einsum
 
+import cs336_basics.model
 from cs336_basics.model import BasicsTransformerLM
-from cs336_basics.nn_utils import cross_entropy
+from cs336_basics.nn_utils import cross_entropy, softmax
 from cs336_basics.optimizer import AdamW
 
 # Model configurations from Table 1 of the assignment handout (section 2.1.2).
@@ -54,6 +65,53 @@ def synchronize(device: torch.device) -> None:
         torch.mps.synchronize()
 
 
+def cap_to_dedicated_vram(device: torch.device, headroom_bytes: int = 512 * 2**20) -> None:
+    """Make PyTorch raise OOM once the GPU's currently free dedicated memory is used up.
+
+    On Windows the NVIDIA driver otherwise spills allocations into shared system
+    memory instead of failing, which silently makes every step orders of
+    magnitude slower. The headroom covers memory outside PyTorch's allocator
+    (CUDA context, cuBLAS workspaces).
+    """
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    free, total = torch.cuda.mem_get_info(index)
+    torch.cuda.set_per_process_memory_fraction(max(free - headroom_bytes, 0) / total, index)
+
+
+@nvtx.range("scaled dot product attention")
+def annotated_scaled_dot_product_attention(Q, K, V, mask=None):
+    """cs336_basics.model.scaled_dot_product_attention with an NVTX range around each stage."""
+    d_k = K.shape[-1]
+    with nvtx.range("computing attention scores"):
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+        if mask is not None:
+            attention_scores = torch.where(mask, attention_scores, float("-inf"))
+    with nvtx.range("computing softmax"):
+        attention_weights = softmax(attention_scores, dim=-1)
+    with nvtx.range("final matmul"):
+        return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+
+
+def add_nvtx_module_ranges(model: torch.nn.Module) -> None:
+    """Wrap every submodule's forward in an NVTX range such as ``Linear:layers.*.ffn.w1`` (layer indices are wildcarded)."""
+
+    # Hooks must return None: any other return value replaces the module's inputs/output.
+    def push(label: str):
+        def hook(_module, _inputs) -> None:
+            nvtx.range_push(label)
+
+        return hook
+
+    def pop(_module, _inputs, _output) -> None:
+        nvtx.range_pop()
+
+    for name, module in model.named_modules():
+        if not name:
+            continue
+        module.register_forward_pre_hook(push(f"{type(module).__name__}:{re.sub(r'\.\d+(?=\.|$)', '.*', name)}"))
+        module.register_forward_hook(pop)
+
+
 def benchmark(
     d_model: int,
     d_ff: int,
@@ -68,6 +126,7 @@ def benchmark(
     device: torch.device,
     mixed_precision: bool = False,
     compile_model: bool = False,
+    use_nvtx: bool = False,
 ) -> dict[str, np.ndarray]:
     """Run warm-up + timed steps; return per-phase arrays of per-step seconds."""
     model = BasicsTransformerLM(
@@ -78,6 +137,8 @@ def benchmark(
         num_heads=num_heads,
         d_ff=d_ff,
     ).to(device)
+    if use_nvtx:
+        add_nvtx_module_ranges(model)
     if compile_model:
         model = torch.compile(model)
 
@@ -86,45 +147,54 @@ def benchmark(
     inputs = torch.randint(0, vocab_size, (batch_size, context_length), device=device)
     targets = torch.randint(0, vocab_size, (batch_size, context_length), device=device)
 
-    autocast_ctx = (
-        torch.autocast(device_type=device.type, dtype=torch.bfloat16)
-        if mixed_precision
-        else nullcontext()
-    )
+    def autocast():
+        return torch.autocast(device_type=device.type, dtype=torch.bfloat16) if mixed_precision else nullcontext()
 
-    timings: dict[str, list[float]] = {"forward": []}
-    if mode in ("forward_backward", "full"):
-        timings["backward"] = []
-    if mode == "full":
-        timings["optimizer"] = []
+    def nvtx_range(name: str):
+        return nvtx.range(name) if use_nvtx else nullcontext()
 
-    for step in range(warmup + steps):
-        measured = step >= warmup
+    phases = {"forward": ["forward"], "forward_backward": ["forward", "backward"], "full": ["forward", "backward", "optimizer"]}[mode]
+    timings: dict[str, list[float]] = {phase: [] for phase in phases}
+
+    def run_step(record: bool) -> None:
+        # Gradients are cleared outside the timed regions, so `backward` costs the same in every mode.
+        model.zero_grad(set_to_none=True)
+        elapsed = {}
+
+        with nvtx_range("forward"):
+            start = timeit.default_timer()
+            # Forward-only mode is inference: no autograd graph, so no activations are kept for a backward pass.
+            with torch.set_grad_enabled(mode != "forward"), autocast():
+                logits = model(inputs)
+                with nvtx_range("loss"):
+                    loss = cross_entropy(logits, targets)
+            synchronize(device)
+            elapsed["forward"] = timeit.default_timer() - start
+
+        if "backward" in timings:
+            with nvtx_range("backward"):
+                start = timeit.default_timer()
+                loss.backward()
+                synchronize(device)
+                elapsed["backward"] = timeit.default_timer() - start
 
         if optimizer is not None:
-            optimizer.zero_grad(set_to_none=True)
+            with nvtx_range("optimizer"):
+                start = timeit.default_timer()
+                optimizer.step()
+                synchronize(device)
+                elapsed["optimizer"] = timeit.default_timer() - start
 
-        start = timeit.default_timer()
-        with autocast_ctx:
-            logits = model(inputs)
-            loss = cross_entropy(logits, targets)
-        synchronize(device)
-        if measured:
-            timings["forward"].append(timeit.default_timer() - start)
+        if record:
+            for phase, seconds in elapsed.items():
+                timings[phase].append(seconds)
 
-        if mode in ("forward_backward", "full"):
-            start = timeit.default_timer()
-            loss.backward()
-            synchronize(device)
-            if measured:
-                timings["backward"].append(timeit.default_timer() - start)
-
-        if mode == "full":
-            start = timeit.default_timer()
-            optimizer.step()
-            synchronize(device)
-            if measured:
-                timings["optimizer"].append(timeit.default_timer() - start)
+    with nvtx_range("warmup"):
+        for _ in range(warmup):
+            run_step(record=False)
+    with nvtx_range("measure"):
+        for _ in range(steps):
+            run_step(record=True)
 
     return {phase: np.array(times) for phase, times in timings.items()}
 
@@ -149,53 +219,86 @@ def main() -> None:
         "--mode",
         choices=MODES,
         default="full",
-        help="forward: forward pass only; forward_backward: forward + backward; full: forward + backward + optimizer step",
+        help="forward: forward pass only, as inference under no_grad; forward_backward: forward + backward; full: forward + backward + optimizer step",
     )
     parser.add_argument("--warmup", type=int, default=5, help="Number of warm-up steps (not timed)")
     parser.add_argument("--steps", type=int, default=10, help="Number of timed steps")
     parser.add_argument("--device", default=None, help="Device to run on (default: cuda if available, else mps, else cpu)")
     parser.add_argument("--mixed-precision", action="store_true", help="Run under BF16 autocast")
     parser.add_argument("--compile", action="store_true", help="Wrap the model in torch.compile")
+    parser.add_argument(
+        "--nvtx",
+        action="store_true",
+        help="Emit NVTX ranges for nsys: warmup/measure, forward/loss/backward/optimizer, one per module, and the stages of scaled dot-product attention",
+    )
     parser.add_argument("--latex", action="store_true", help="Also print the results table as LaTeX")
+    parser.add_argument("--json-out", default=None, help="Append one JSON line per benchmarked config (with per-step timings) to this file")
     args = parser.parse_args()
 
     device = get_device(args.device)
-    print(f"device={device}, mode={args.mode}, warmup={args.warmup}, steps={args.steps}, "
-          f"batch_size={args.batch_size}, context_length={args.context_length}, "
-          f"mixed_precision={args.mixed_precision}, compile={args.compile}")
+    if device.type == "cuda":
+        cap_to_dedicated_vram(device)
+    if args.nvtx:
+        cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+    print(
+        f"device={device}, mode={args.mode}, warmup={args.warmup}, steps={args.steps}, "
+        f"batch_size={args.batch_size}, context_length={args.context_length}, "
+        f"mixed_precision={args.mixed_precision}, compile={args.compile}, nvtx={args.nvtx}"
+    )
 
     if args.size is not None:
         configs = {name: MODEL_CONFIGS[name] for name in args.size}
     else:
-        configs = {
-            "custom": dict(d_model=args.d_model, d_ff=args.d_ff, num_layers=args.num_layers, num_heads=args.num_heads)
-        }
+        configs = {"custom": dict(d_model=args.d_model, d_ff=args.d_ff, num_layers=args.num_layers, num_heads=args.num_heads)}
 
     rows = []
     for name, config in configs.items():
-        timings = benchmark(
-            **config,
-            vocab_size=args.vocab_size,
-            context_length=args.context_length,
-            batch_size=args.batch_size,
-            mode=args.mode,
-            warmup=args.warmup,
-            steps=args.steps,
-            device=device,
-            mixed_precision=args.mixed_precision,
-            compile_model=args.compile,
-        )
-        row: dict[str, object] = {"size": name}
-        for phase, times in timings.items():
-            row[f"{phase}_mean_ms"] = times.mean() * 1e3
-            row[f"{phase}_std_ms"] = times.std() * 1e3
-        total = np.sum([times for times in timings.values()], axis=0)
-        row["total_mean_ms"] = total.mean() * 1e3
-        row["total_std_ms"] = total.std() * 1e3
+        row: dict[str, object] = {"size": name, "context_length": args.context_length, "mode": args.mode, "warmup": args.warmup, "status": "ok"}
+        record = dict(row, steps=args.steps, batch_size=args.batch_size, mixed_precision=args.mixed_precision, compile=args.compile, nvtx=args.nvtx, **config)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        try:
+            timings = benchmark(
+                **config,
+                vocab_size=args.vocab_size,
+                context_length=args.context_length,
+                batch_size=args.batch_size,
+                mode=args.mode,
+                warmup=args.warmup,
+                steps=args.steps,
+                device=device,
+                mixed_precision=args.mixed_precision,
+                compile_model=args.compile,
+                use_nvtx=args.nvtx,
+            )
+        except torch.OutOfMemoryError:
+            timings = {}
+            row["status"] = record["status"] = "OOM"
+            print(f"[{name}] out of memory")
+        else:
+            # Sample standard deviation across the measured steps.
+            ddof = 1 if args.steps > 1 else 0
+            for phase, times in timings.items():
+                row[f"{phase}_mean_ms"] = times.mean() * 1e3
+                row[f"{phase}_std_ms"] = times.std(ddof=ddof) * 1e3
+            total = np.sum(list(timings.values()), axis=0)
+            row["total_mean_ms"] = total.mean() * 1e3
+            row["total_std_ms"] = total.std(ddof=ddof) * 1e3
+            print(f"[{name}] " + "  ".join(f"{phase}: {times.mean() * 1e3:.2f} ± {times.std(ddof=ddof) * 1e3:.2f} ms" for phase, times in timings.items()))
+        if device.type == "cuda":
+            row["peak_mem_gb"] = torch.cuda.max_memory_allocated(device) / 2**30
         rows.append(row)
-        print(f"[{name}] " + "  ".join(
-            f"{phase}: {times.mean() * 1e3:.2f} ± {times.std() * 1e3:.2f} ms" for phase, times in timings.items()
-        ))
+
+        if args.json_out is not None:
+            record.update({key: value for key, value in row.items() if key not in record})
+            record["step_ms"] = {phase: (times * 1e3).tolist() for phase, times in timings.items()}
+            with open(args.json_out, "a") as f:
+                f.write(json.dumps(record) + "\n")
+
+        # Release this model's memory before building the next one.
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     df = pd.DataFrame(rows).round(2)
     print()

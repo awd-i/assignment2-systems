@@ -33,7 +33,14 @@ python-preference = "managed"
 
 [tool.uv.sources]
 cs336-basics = { path = "./cs336-basics", editable = true } # Change this path to your assignment1-basics repo you want to use your own implementation!
+# PyPI only ships CPU-only torch wheels for Windows, so pull the CUDA 12.8 build there.
+# Linux/macOS resolution is unchanged.
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'win32'" }]
 
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 
 [tool.pytest.ini_options]
